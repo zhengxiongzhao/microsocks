@@ -34,6 +34,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <limits.h>
+#include <sys/time.h> /* struct timeval for SO_RCVTIMEO/SO_SNDTIMEO */
 #include "server.h"
 #include "sblist.h"
 
