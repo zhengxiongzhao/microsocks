@@ -58,9 +58,10 @@ int sblist_set(sblist* l, void* item, size_t pos) {
 int sblist_grow_if_needed(sblist* l) {
 	char* temp;
 	if(l->count == l->capa) {
-		temp = realloc(l->items, (l->capa + l->blockitems) * l->itemsize);
+		size_t next_capa = l->capa ? l->capa * 2 : l->blockitems;
+		temp = realloc(l->items, next_capa * l->itemsize);
 		if(!temp) return 0;
-		l->capa += l->blockitems;
+		l->capa = next_capa;
 		l->items = temp;
 	}
 	return 1;

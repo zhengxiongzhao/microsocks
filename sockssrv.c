@@ -27,6 +27,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdatomic.h>
 #include <pthread.h>
 #include <signal.h>
 #include <poll.h>
@@ -40,6 +41,16 @@
    cpu usage. */
 #ifndef FAILURE_TIMEOUT
 #define FAILURE_TIMEOUT 64
+#endif
+
+/* hard upper bound for the auth_once whitelist. without this, the list
+   grows unboundedly with every distinct client IP that authenticates
+   (one byte of leaked memory per IP forever), and the O(n) linear scan
+   in is_in_authed_list() degrades handshake latency over time.
+   65536 * sizeof(union sockaddr_union) (~28B) ~= 1.8 MiB cap.
+   when full, the oldest entry is evicted (simple LRU). */
+#ifndef AUTH_IPS_MAX
+#define AUTH_IPS_MAX 65536
 #endif
 
 #ifndef MAX
@@ -72,6 +83,11 @@ static pthread_rwlock_t auth_ips_lock = PTHREAD_RWLOCK_INITIALIZER;
 static const struct server* server;
 static union sockaddr_union bind_addr = {.v4.sin_family = AF_UNSPEC};
 
+/* recycle pool for struct thread, accessed only from the main thread
+   (both alloc and release happen in the accept loop), so no locking
+   is required. avoids per-connection malloc/free churn under load. */
+static sblist* threadpool;
+
 enum socksstate {
 	SS_1_CONNECTED,
 	SS_2_NEED_AUTH, /* skipped if NO_AUTH method supported */
@@ -101,7 +117,12 @@ struct thread {
 	pthread_t pt;
 	struct client client;
 	enum socksstate state;
-	volatile int  done;
+	/* C11 atomic: the worker thread stores 1 on exit, the main thread
+	   loads it when sweeping for joinable threads. "volatile int" does
+	   NOT provide a memory barrier and is a data race per the standard,
+	   which can leak joined-but-undetected thread structs on weakly
+	   ordered architectures (ARM, etc). */
+	atomic_int done;
 };
 
 #ifndef CONFIG_LOG
@@ -115,6 +136,50 @@ struct thread {
 #else
 static void dolog(const char* fmt, ...) { }
 #endif
+
+/* write exactly n bytes, retrying on EINTR and handling short writes.
+   returns 0 on success, -1 on error. the original code used bare write()
+   for fixed-size protocol frames, which can deliver a partial frame on a
+   socket (EINTR, kernel buffer pressure) and corrupt the SOCKS5 handshake. */
+static int write_all(int fd, const void *buf, size_t n) {
+	const char *p = buf;
+	while(n) {
+		ssize_t w = write(fd, p, n);
+		if(w < 0) {
+			if(errno == EINTR) continue;
+			return -1;
+		}
+		if(w == 0) return -1;
+		p += w;
+		n -= (size_t)w;
+	}
+	return 0;
+}
+
+/* map a connect/socket/bind errno to a negative SOCKS5 error code.
+   taking errno by value lets the caller save it before close()/freeaddrinfo()
+   clobber it (those syscalls overwrite errno even on success). */
+static int errno_to_ec(int e) {
+	switch(e) {
+		case ETIMEDOUT:
+			return -EC_TTL_EXPIRED;
+		case EPROTOTYPE:
+		case EPROTONOSUPPORT:
+		case EAFNOSUPPORT:
+			return -EC_ADDRESSTYPE_NOT_SUPPORTED;
+		case ECONNREFUSED:
+			return -EC_CONN_REFUSED;
+		case ENETDOWN:
+		case ENETUNREACH:
+			return -EC_NET_UNREACHABLE;
+		case EHOSTUNREACH:
+			return -EC_HOST_UNREACHABLE;
+		default:
+			errno = e;
+			perror("socket/connect");
+			return -EC_GENERAL_FAILURE;
+	}
+}
 
 static struct addrinfo* addr_choose(struct addrinfo* list, union sockaddr_union* bindaddr) {
 	int af = SOCKADDR_UNION_AF(bindaddr);
@@ -162,35 +227,28 @@ static int connect_socks_target(unsigned char *buf, size_t n, struct client *cli
 	if(resolve(namebuf, port, &remote)) return -EC_GENERAL_FAILURE;
 	struct addrinfo* raddr = addr_choose(remote, &bind_addr);
 	int fd = socket(raddr->ai_family, SOCK_STREAM, 0);
+	/* on every failing syscall below we snapshot errno first, then close()/freeaddrinfo(),
+	   then translate. the previous code jumped to a label that ran close() *before*
+	   consulting errno, so the reported SOCKS5 error code was taken from close()'s
+	   own errno side effect rather than the real connect/socket failure. */
 	if(fd == -1) {
-		eval_errno:
-		if(fd != -1) close(fd);
+		int e = errno;
 		freeaddrinfo(remote);
-		switch(errno) {
-			case ETIMEDOUT:
-				return -EC_TTL_EXPIRED;
-			case EPROTOTYPE:
-			case EPROTONOSUPPORT:
-			case EAFNOSUPPORT:
-				return -EC_ADDRESSTYPE_NOT_SUPPORTED;
-			case ECONNREFUSED:
-				return -EC_CONN_REFUSED;
-			case ENETDOWN:
-			case ENETUNREACH:
-				return -EC_NET_UNREACHABLE;
-			case EHOSTUNREACH:
-				return -EC_HOST_UNREACHABLE;
-			case EBADF:
-			default:
-			perror("socket/connect");
-			return -EC_GENERAL_FAILURE;
-		}
+		return errno_to_ec(e);
 	}
 	if(SOCKADDR_UNION_AF(&bind_addr) == raddr->ai_family &&
-	   bindtoip(fd, &bind_addr) == -1)
-		goto eval_errno;
-	if(connect(fd, raddr->ai_addr, raddr->ai_addrlen) == -1)
-		goto eval_errno;
+	   bindtoip(fd, &bind_addr) == -1) {
+		int e = errno;
+		close(fd);
+		freeaddrinfo(remote);
+		return errno_to_ec(e);
+	}
+	if(connect(fd, raddr->ai_addr, raddr->ai_addrlen) == -1) {
+		int e = errno;
+		close(fd);
+		freeaddrinfo(remote);
+		return errno_to_ec(e);
+	}
 
 	freeaddrinfo(remote);
 	if(CONFIG_LOG) {
@@ -223,6 +281,10 @@ static int is_in_authed_list(union sockaddr_union *caddr) {
 }
 
 static void add_auth_ip(union sockaddr_union *caddr) {
+	/* bound the whitelist to prevent unbounded memory growth and
+	   unbounded O(n) scan time; evict the oldest entry (LRU) when full. */
+	if(sblist_getsize(auth_ips) >= AUTH_IPS_MAX)
+		sblist_delete(auth_ips, 0);
 	sblist_add(auth_ips, caddr);
 }
 
@@ -256,14 +318,14 @@ static void send_auth_response(int fd, int version, enum authmethod meth) {
 	unsigned char buf[2];
 	buf[0] = version;
 	buf[1] = meth;
-	write(fd, buf, 2);
+	write_all(fd, buf, 2);
 }
 
 static void send_error(int fd, enum errorcode ec) {
 	/* position 4 contains ATYP, the address type, which is the same as used in the connect
 	   request. we're lazy and return always IPV4 address type in errors. */
 	char buf[10] = { 5, ec, 0, 1 /*AT_IPV4*/, 0,0,0,0, 0,0 };
-	write(fd, buf, 10);
+	write_all(fd, buf, 10);
 }
 
 static void copyloop(int fd1, int fd2) {
@@ -284,18 +346,18 @@ static void copyloop(int fd1, int fd2) {
 				else perror("poll");
 				return;
 		}
-		int infd = (fds[0].revents & POLLIN) ? fd1 : fd2;
-		int outfd = infd == fd2 ? fd1 : fd2;
-		/* since the biggest stack consumer in the entire code is
-		   libc's getaddrinfo(), we can safely use at least half the
-		   available stacksize to improve throughput. */
-		char buf[MIN(16*1024, THREAD_STACK_SIZE/2)];
-		ssize_t sent = 0, n = read(infd, buf, sizeof buf);
-		if(n <= 0) return;
-		while(sent < n) {
-			ssize_t m = write(outfd, buf+sent, n-sent);
-			if(m < 0) return;
-			sent += m;
+		if((fds[0].revents & (POLLERR | POLLNVAL)) || (fds[1].revents & (POLLERR | POLLNVAL)))
+			return;
+
+		for(int i = 0; i < 2; i++) {
+			if(fds[i].revents & (POLLIN | POLLHUP)) {
+				int infd = fds[i].fd;
+				int outfd = fds[1 - i].fd;
+				char buf[MIN(16*1024, THREAD_STACK_SIZE/2)];
+				ssize_t n = read(infd, buf, sizeof buf);
+				if(n <= 0) return;
+				if(write_all(outfd, buf, (size_t)n) < 0) return;
+			}
 		}
 	}
 }
@@ -359,24 +421,51 @@ static int handshake(struct thread *t) {
 
 static void* clientthread(void *data) {
 	struct thread *t = data;
+	struct timeval tv = { .tv_sec = 10, .tv_usec = 0 };
+	setsockopt(t->client.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	setsockopt(t->client.fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 	int remotefd = handshake(t);
 	if(remotefd != -1) {
+		tv.tv_sec = 0;
+		tv.tv_usec = 0;
+		setsockopt(t->client.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+		setsockopt(t->client.fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 		copyloop(t->client.fd, remotefd);
 		close(remotefd);
 	}
 	close(t->client.fd);
-	t->done = 1;
+	atomic_store(&t->done, 1);
 	return 0;
+}
+
+/* allocate a struct thread, preferring the recycle pool over malloc
+	  to cut down allocator churn under high connection rates. */
+static struct thread* thread_alloc(void) {
+	size_t sz = sblist_getsize(threadpool);
+	if(sz) {
+		struct thread* t = *((struct thread**)sblist_get(threadpool, sz - 1));
+		sblist_delete_fast(threadpool, sz - 1);
+		return t;
+	}
+	return malloc(sizeof (struct thread));
+}
+
+/* return a thread struct to the recycle pool. only called from the main
+	  accept loop, so the pool needs no locking. on OOM the struct is simply
+	  freed since we were going to free it anyway before adding the freelist. */
+static void thread_release(struct thread *t) {
+	if(!sblist_add(threadpool, &t))
+		free(t);
 }
 
 static void collect(sblist *threads) {
 	size_t i;
 	for(i=0;i<sblist_getsize(threads);) {
 		struct thread* thread = *((struct thread**)sblist_get(threads, i));
-		if(thread->done) {
+		if(atomic_load(&thread->done)) {
 			pthread_join(thread->pt, 0);
-			sblist_delete(threads, i);
-			free(thread);
+			sblist_delete_fast(threads, i);
+			thread_release(thread);
 		} else
 			i++;
 	}
@@ -474,6 +563,7 @@ int main(int argc, char** argv) {
 	signal(SIGPIPE, SIG_IGN);
 	struct server s;
 	sblist *threads = sblist_new(sizeof (struct thread*), 8);
+	threadpool = sblist_new(sizeof (struct thread*), 8);
 	if(server_setup(&s, listenip, port)) {
 		perror("server_setup");
 		return 1;
@@ -483,19 +573,19 @@ int main(int argc, char** argv) {
 	while(1) {
 		collect(threads);
 		struct client c;
-		struct thread *curr = malloc(sizeof (struct thread));
+		struct thread *curr = thread_alloc();
 		if(!curr) goto oom;
-		curr->done = 0;
+		atomic_init(&curr->done, 0);
 		if(server_waitclient(&s, &c)) {
 			dolog("failed to accept connection\n");
-			free(curr);
+			thread_release(curr);
 			usleep(FAILURE_TIMEOUT);
 			continue;
 		}
 		curr->client = c;
 		if(!sblist_add(threads, &curr)) {
 			close(curr->client.fd);
-			free(curr);
+			thread_release(curr);
 			oom:
 			dolog("rejecting connection due to OOM\n");
 			usleep(FAILURE_TIMEOUT); /* prevent 100% CPU usage in OOM situation */
@@ -506,8 +596,12 @@ int main(int argc, char** argv) {
 			a = &attr;
 			pthread_attr_setstacksize(a, THREAD_STACK_SIZE);
 		}
-		if(pthread_create(&curr->pt, a, clientthread, curr) != 0)
+		if(pthread_create(&curr->pt, a, clientthread, curr) != 0) {
 			dolog("pthread_create failed. OOM?\n");
+			close(curr->client.fd);
+			sblist_delete_fast(threads, sblist_getsize(threads) - 1);
+			thread_release(curr);
+		}
 		if(a) pthread_attr_destroy(&attr);
 	}
 }

@@ -10,7 +10,10 @@ OBJS = $(SRCS:.c=.o)
 
 LIBS = -lpthread
 
-CFLAGS += -Wall -std=c99
+# gnu11 (not c99): we now use C11 <stdatomic.h> for the thread "done"
+# flag to fix a data race that "volatile int" does not prevent on
+# weakly ordered architectures (ARM, MIPS, ...).
+CFLAGS += -Wall -std=gnu11
 
 INSTALL = ./install.sh
 

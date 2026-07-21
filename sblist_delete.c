@@ -7,3 +7,12 @@ void sblist_delete(sblist* l, size_t item) {
 		l->count--;
 	}
 }
+
+void sblist_delete_fast(sblist* l, size_t item) {
+	if (l->count && item < l->count) {
+		if (item != l->count - 1) {
+			memcpy(sblist_item_from_index(l, item), sblist_item_from_index(l, l->count - 1), l->itemsize);
+		}
+		l->count--;
+	}
+}
